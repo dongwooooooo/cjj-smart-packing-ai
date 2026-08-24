@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Model artifacts — weights never enter the repo
+*.safetensors
+*.pt
+*.pth
+*.onnx
+models/
+results/
+
+# Env / secrets
+.env
+.env.*
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
