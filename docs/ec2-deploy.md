@@ -57,12 +57,12 @@ bash run_dome.sh
 ```bash
 curl -X POST http://<인스턴스IP>:8000/predict \
   -H "X-API-Key: xxx" \
-  -F "front=@front.jpg" \
-  -F "side=@side.jpg" \
-  -F "top=@top.jpg"
+  -F "images=@1.jpg" \
+  -F "images=@2.jpg" \
+  -F "images=@3.jpg"
 ```
 
-`front`/`side`/`top` 세 장(정면·측면·상단)을 보내는 형태다. 실제 필드명·응답 형식은 `inference/server.py` 정의를 따르므로 호출 전에 확인한다.
+`images` 필드로 3면 사진 3장을 보낸다. 응답 형식은 `inference/server.py` 정의를 따른다.
 
 ## 운영
 
