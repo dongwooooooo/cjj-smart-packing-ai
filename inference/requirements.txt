@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-multipart
+pillow
+numpy
+mangum
+
+# The following are required once the real HF ek09/logistics-dimension-3view
+# logic is merged into dimension.py, and are intentionally omitted from this
+# skeleton:
+# torch
+# timm
+# segmentation-models-pytorch
+# safetensors
+# scipy
+# huggingface_hub
