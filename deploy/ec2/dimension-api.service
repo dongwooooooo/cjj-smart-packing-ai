@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=ec2-user
-WorkingDirectory=/home/ec2-user/model
+User=ubuntu
+WorkingDirectory=/home/ubuntu/model
 EnvironmentFile=/etc/dimension-api.env
-ExecStart=/home/ec2-user/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
+ExecStart=/home/ubuntu/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
 
