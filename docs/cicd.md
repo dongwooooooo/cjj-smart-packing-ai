@@ -79,7 +79,10 @@ GitHub Actions가 위임받을 역할이다. 신뢰 정책에 저장소 조건�
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:cj-ai-sw/ai:*"
+          "token.actions.githubusercontent.com:sub": [
+            "repo:cj-ai-sw/ai:*",
+            "repo:cj-ai-sw@316033991/ai@1340552961:*"
+          ]
         }
       }
     }
@@ -87,7 +90,9 @@ GitHub Actions가 위임받을 역할이다. 신뢰 정책에 저장소 조건�
 }
 ```
 
-역할을 쓸 수 있는 범위는 `sub` 조건이 정한다. `repo:cj-ai-sw/ai:*`는 이 저장소의 모든 브랜치·태그·환경을 허용한다. main 머지에서만 쓰게 좁히려면 `repo:cj-ai-sw/ai:ref:refs/heads/main`으로 바꾼다. 다만 그렇게 하면 `workflow_dispatch`를 다른 브랜치에서 돌릴 때 위임이 거부된다.
+이 조직의 토큰은 `sub` 클레임에 소유자·저장소 ID가 붙은 형식(`repo:cj-ai-sw@316033991/ai@1340552961:ref:...`)으로 발급된다(2026-08-25 실측). 이름만 쓴 패턴은 매칭에 실패해 `Not authorized to perform sts:AssumeRoleWithWebIdentity`가 나므로 두 형식을 모두 넣는다. ID는 토큰의 `repository_owner_id`·`repository_id` 클레임 값이다.
+
+역할을 쓸 수 있는 범위는 `sub` 조건이 정한다. `:*`는 이 저장소의 모든 브랜치·태그·환경을 허용한다. main 머지에서만 쓰게 좁히려면 `repo:cj-ai-sw/ai:ref:refs/heads/main`으로 바꾼다. 다만 그렇게 하면 `workflow_dispatch`를 다른 브랜치에서 돌릴 때 위임이 거부된다.
 
 `permissions-policy.json` — ECR push와 Lambda 갱신에 필요한 권한만 담는다:
 
@@ -106,8 +111,10 @@ GitHub Actions가 위임받을 역할이다. 신뢰 정책에 저장소 조건�
       "Effect": "Allow",
       "Action": [
         "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
         "ecr:CompleteLayerUpload",
         "ecr:DescribeRepositories",
+        "ecr:GetDownloadUrlForLayer",
         "ecr:InitiateLayerUpload",
         "ecr:PutImage",
         "ecr:UploadLayerPart"
