@@ -4,7 +4,7 @@
 # 필수/선택 환경변수 (인자가 아니라 환경변수로 받는다):
 #   HF_TOKEN      허깅페이스 토큰 (필수)
 #   API_KEY       API 인증 키, X-API-Key 헤더 검증용 (선택, 비우면 인증 없음)
-#   MODEL_SOURCE  허깅페이스 모델 저장소 (기본값: ek09/logistics-dimension-3view)
+#   MODEL_SOURCE  허깅페이스 모델 저장소 (기본값: althdgk/cj_A.LTS_AI_B_2026)
 #   PORT          서비스 포트 (기본값: 8000)
 #
 # 사용법:
@@ -17,7 +17,7 @@ set -euo pipefail
 
 : "${HF_TOKEN:?HF_TOKEN 환경변수가 필요합니다. 예: HF_TOKEN=hf_xxx bash setup.sh}"
 API_KEY="${API_KEY:-}"
-MODEL_SOURCE="${MODEL_SOURCE:-ek09/logistics-dimension-3view}"
+MODEL_SOURCE="${MODEL_SOURCE:-althdgk/cj_A.LTS_AI_B_2026}"
 PORT="${PORT:-8000}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

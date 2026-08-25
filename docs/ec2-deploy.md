@@ -10,8 +10,8 @@
 
 1. 허깅페이스 설정 → Access Tokens → Create new token → Token type을 **Fine-grained**로 선택
 2. Repository permissions에서 아래 저장소 2개에 **Read** 권한만 추가
-   - `ek09/logistics-dimension-3view`
-   - `ek09/logistics-dimension-dome-fast`
+   - `althdgk/cj_A.LTS_AI_B_2026` (메인 모델)
+   - `ek09/logistics-dimension-dome-fast` (흰 돔 전용 모델 — 띄울 경우에만. 소유 계정이 달라 별도 권한 부여 필요)
 3. 그 외 권한(쓰기, 다른 저장소 접근 등)은 모두 끈 채로 발급
 
 발급한 토큰은 인스턴스에 파일로 저장하지 않고 실행할 때 환경변수로만 넘긴다. 아래 "배포 절차" 참고.
@@ -94,6 +94,6 @@ torch와 torchvision의 빌드가 서로 안 맞을 때 나는 에러다. torch�
 모델을 허깅페이스가 아닌 다른 곳(S3 등)에 두게 되면 `MODEL_SOURCE` 환경변수만 바꾸면 된다. 단, 현재 `setup.sh`/`run_dome.sh`는 허깅페이스 `snapshot_download`를 호출하는 구조라, 저장소 종류 자체가 바뀌면(S3 등) 다운로드 부분 코드도 함께 고쳐야 한다.
 
 ```bash
-export MODEL_SOURCE=ek09/logistics-dimension-3view-v2   # 새 저장소명
+export MODEL_SOURCE=althdgk/다음-저장소명   # 새 저장소명
 bash setup.sh
 ```
