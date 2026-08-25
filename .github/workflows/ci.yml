@@ -1,0 +1,88 @@
+# Lightweight checks on every pull request into main.
+#
+# Deliberately does not build the container image: the image runs to several GB
+# once torch and the model weights are enabled, and it needs AWS credentials.
+# Image builds happen after merge, in build-deploy.yml.
+name: ci
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: syntax checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Matches the Lambda base image (public.ecr.aws/lambda/python:3.12), so a
+      # syntax error that only 3.12 rejects is caught here rather than at runtime.
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python sources
+        run: |
+          set -euo pipefail
+          COUNT="$(find inference -name '*.py' -not -path '*/__pycache__/*' | wc -l | tr -d '[:space:]')"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::inference/ 에 검사할 .py 파일이 없습니다."
+            exit 1
+          fi
+          find inference -name '*.py' -not -path '*/__pycache__/*' -print
+          find inference -name '*.py' -not -path '*/__pycache__/*' -print0 \
+            | xargs -0 python -m py_compile
+          echo "Python 문법 검사 통과 (${COUNT}개 파일)"
+
+      - name: Check shell scripts
+        run: |
+          set -euo pipefail
+          FOUND=0
+          while IFS= read -r script; do
+            echo "bash -n ${script}"
+            bash -n "$script"
+            FOUND=1
+          done < <(find deploy -name '*.sh')
+          if [ "$FOUND" -eq 0 ]; then
+            echo "deploy/ 에 검사할 .sh 파일 없음 — 건너뜀"
+          else
+            echo "셸 스크립트 문법 검사 통과"
+          fi
+
+      # setup-python gives a clean interpreter, so PyYAML has to be installed
+      # here even though the system Python on the runner ships with it.
+      - name: Check workflow YAML
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          import yaml
+
+          failed = []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(path.read_text())
+              except yaml.YAMLError as exc:
+                  failed.append(f"{path}: {exc}")
+              else:
+                  print(f"ok {path}")
+
+          if failed:
+              print("\n".join(failed), file=sys.stderr)
+              sys.exit(1)
+          PY
+          echo "워크플로 YAML 문법 검사 통과"

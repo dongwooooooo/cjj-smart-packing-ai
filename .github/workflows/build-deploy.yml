@@ -1,0 +1,187 @@
+# Builds the Lambda container image, pushes it to ECR, and points the
+# Lambda function at the new image.
+#
+# Runs on pushes to main that touch the inference code or the Lambda build
+# files, and on manual dispatch.
+#
+# Credentials: GitHub OIDC only. No long-lived AWS access keys are stored in
+# this repository. See docs/cicd.md for the IAM role setup.
+name: build-deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'inference/**'
+      - 'deploy/lambda/**'
+      - '.github/workflows/build-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to push. Defaults to the commit short sha.'
+        required: false
+        type: string
+        default: ''
+
+# id-token: write is what lets the runner request an OIDC token and assume the
+# AWS role. contents: read is all the checkout needs.
+permissions:
+  contents: read
+  id-token: write
+
+# Only one build at a time per branch. A newer push supersedes an in-flight
+# build instead of racing it to the :latest tag.
+concurrency:
+  group: build-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPO: logistics-dimension-api
+
+jobs:
+  build-push:
+    name: build and push image
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.meta.outputs.image_uri }}
+      image-tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The repository is created once by hand (docs/lambda-deploy.md), so the
+      # CI role does not need ecr:CreateRepository. Fail early with a readable
+      # message instead of letting the push fail with a bare 404.
+      - name: Check that the ECR repository exists
+        run: |
+          if ! aws ecr describe-repositories \
+                 --region "$AWS_REGION" \
+                 --repository-names "$ECR_REPO" >/dev/null 2>&1; then
+            echo "::error::ECR 저장소 '${ECR_REPO}' 가 리전 ${AWS_REGION} 에 없습니다. docs/lambda-deploy.md 의 '최초 1회 절차' 를 먼저 수행하세요."
+            exit 1
+          fi
+          echo "ECR 저장소 확인: ${ECR_REPO} (${AWS_REGION})"
+
+      # Read the dispatch input through env rather than interpolating it into
+      # the script body, so the tag string cannot inject shell commands.
+      - name: Resolve image tag
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          TAG_INPUT: ${{ inputs.image_tag }}
+        run: |
+          TAG="${TAG_INPUT:-$(git rev-parse --short HEAD)}"
+          if ! printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]{1,128}$'; then
+            echo "::error::이미지 태그 '${TAG}' 형식이 올바르지 않습니다. 영문·숫자·'.'·'_'·'-' 만 사용하세요."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${REGISTRY}/${ECR_REPO}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "빌드 대상: ${REGISTRY}/${ECR_REPO}:${TAG}"
+
+      # BuildKit is required by the Dockerfile's --mount=type=secret step.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # platforms/provenance are not optional here: Lambda rejects arm64 images
+      # and rejects the OCI attestation manifest that Buildx attaches by default.
+      #
+      # No build cache is configured yet. Once the torch install and the model
+      # download steps are enabled the image runs to several GB, which does not
+      # fit the GitHub Actions cache quota — an ECR-backed cache would be the
+      # replacement. See docs/cicd.md.
+      #
+      # The token goes through secret-envs rather than secrets: the latter takes
+      # the literal value, and an unregistered HF_TOKEN would make the whole step
+      # fail with "hf_token= is not a valid secret". secret-envs passes the env
+      # var *name*, so the step still runs while the model download step in the
+      # Dockerfile is commented out and no token exists yet.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        with:
+          context: .
+          file: deploy/lambda/Dockerfile
+          platforms: linux/amd64
+          provenance: false
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_uri }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          secret-envs: |
+            hf_token=HF_TOKEN
+
+      - name: Summary
+        run: |
+          {
+            echo "### 이미지 push 완료"
+            echo ""
+            echo "- 이미지: \`${{ steps.meta.outputs.image_uri }}\`"
+            echo "- 커밋: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-lambda:
+    name: update lambda function
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # The function is created once by hand (docs/lambda-deploy.md). Until it
+      # exists this job reports the image URI and exits successfully, so a
+      # missing function never turns the pipeline red.
+      - name: Update function code
+        env:
+          FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'logistics-dimension-api' }}
+          IMAGE_URI: ${{ needs.build-push.outputs.image-uri }}
+        run: |
+          if ! aws lambda get-function \
+                 --region "$AWS_REGION" \
+                 --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            echo "::notice title=Lambda 함수 없음::'${FUNCTION_NAME}' 함수가 아직 없어 갱신을 건너뜁니다. 최초 생성은 docs/lambda-deploy.md 의 '최초 1회 절차' 를 따르세요. push 된 이미지: ${IMAGE_URI}"
+            {
+              echo "### Lambda 갱신 건너뜀"
+              echo ""
+              echo "함수 \`${FUNCTION_NAME}\` 없음. 최초 생성 절차는 docs/lambda-deploy.md 참고."
+              echo ""
+              echo "생성 시 사용할 이미지: \`${IMAGE_URI}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "함수 갱신: ${FUNCTION_NAME} -> ${IMAGE_URI}"
+          aws lambda update-function-code \
+            --region "$AWS_REGION" \
+            --function-name "$FUNCTION_NAME" \
+            --image-uri "$IMAGE_URI" \
+            --publish >/dev/null
+
+          # update-function-code returns before the new image is live. Without
+          # this wait a following invocation can still hit the old code.
+          aws lambda wait function-updated-v2 \
+            --region "$AWS_REGION" \
+            --function-name "$FUNCTION_NAME"
+
+          {
+            echo "### Lambda 갱신 완료"
+            echo ""
+            echo "- 함수: \`${FUNCTION_NAME}\`"
+            echo "- 이미지: \`${IMAGE_URI}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
