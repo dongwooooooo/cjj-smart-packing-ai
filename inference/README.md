@@ -1,59 +1,51 @@
-# Inference API
+# inference — 치수 추정 추론 API
 
-이 폴더가 추론 API의 단일 원천(single source of truth)입니다. 배포용 컨테이너는
-이 폴더의 `server.py`, `dimension.py`, `requirements.txt`를 그대로 사용합니다.
+물류 상품 사진 3장(shot1 cam1/2/3)에서 가로·세로·높이(cm)를 추정한다.
+코드 원천은 허깅페이스 `althdgk/cj_A.LTS_AI_B_2026`에서 가져온 B담당 배포 패키지이고, 이 저장소가 이후 수정의 단일 원천이다.
 
-## 현재 상태 — 스켈레톤
+| 파일 | 역할 |
+|---|---|
+| `server.py` | FastAPI 서버. 끝의 Mangum 핸들러는 Lambda 배포에서만 활성화 |
+| `dimension.py` | 모델 로드·전처리·추론 (`DimensionModel`) |
+| `inference.py` | CLI 단독 실행 도구 (`python inference.py 1.jpg 2.jpg 3.jpg`) |
+| `requirements.txt` | CPU 전용 torch 포함 의존성 |
 
-실제 추정 로직은 아직 없습니다. `/predict`는 이미지 개수·형식 검증과 API 키 검증까지만
-수행하고, 이후 `dimension.estimate_dimensions()`를 호출하면서 `NotImplementedError`를
-받아 501 Not Implemented를 반환합니다.
-
-실제 로직은 허깅페이스 비공개 저장소 `ek09/logistics-dimension-3view`의
-`server.py`, `dimension.py`에 있습니다. 접근 토큰이 준비되면 아래 절차로 반영합니다.
-
-1. HF 저장소에서 `server.py`, `dimension.py`를 받는다
-2. 이 폴더의 동일 파일과 diff를 뜬다 — 인터페이스(엔드포인트, 인증, 응답 형식)는
-   이 폴더 쪽을 기준으로 유지하고, 추정 로직만 병합한다
-3. `requirements.txt`에 주석으로 남겨둔 `torch`, `timm`,
-   `segmentation-models-pytorch`, `safetensors`, `scipy`, `huggingface_hub`를
-   실제로 추가한다
-4. `python3 -m py_compile server.py dimension.py`와 로컬 실행으로 재검증한다
+모델 가중치(`model.safetensors` 53MB)와 `config.json`은 커밋하지 않는다 — 같은 허깅페이스 저장소에서 받는다.
 
 ## 로컬 실행
 
 ```bash
 cd inference
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-uvicorn server:app --host 0.0.0.0 --port 8000
+# 모델 받기 (읽기 전용 토큰 필요)
+python3 -c "from huggingface_hub import snapshot_download; \
+snapshot_download('althdgk/cj_A.LTS_AI_B_2026', token='<HF_TOKEN>', \
+allow_patterns=['model.safetensors','config.json'], local_dir='.')"
+
+N_THREADS=4 API_KEY=test uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-### 동작 확인
+## 호출
 
 ```bash
-# 상태 확인 — 인증 불필요
 curl http://localhost:8000/health
 
-# 추론 요청 — 이미지 3장 업로드 (스켈레톤 단계에서는 501 반환)
 curl -X POST http://localhost:8000/predict \
-  -F "images=@front.jpg" \
-  -F "images=@side.jpg" \
-  -F "images=@top.jpg"
-
-# API_KEY를 설정했다면 헤더 추가
-curl -X POST http://localhost:8000/predict \
-  -H "X-API-Key: your-api-key" \
-  -F "images=@front.jpg" \
-  -F "images=@side.jpg" \
-  -F "images=@top.jpg"
+  -H "X-API-Key: test" \
+  -F "images=@1.jpg" -F "images=@2.jpg" -F "images=@3.jpg" \
+  -F "views=1-1,1-2,1-3"
 ```
 
-## 환경 변수
+응답: `{"length","width","height","unit":"cm","views_used","warnings","elapsed_ms"}`
 
-| 변수 | 필수 여부 | 설명 |
+`views`를 생략하면 파일명 `..._{shot}_{cam}.jpg`에서 슬롯을 읽고, 그것도 없으면 순서대로 배치하며 경고를 남긴다. 슬롯이 어긋나면 오차가 커지므로 지정을 권장.
+
+## 환경변수
+
+| 변수 | 기본값 | 설명 |
 |---|---|---|
-| `API_KEY` | 선택 | 설정하면 `/predict`가 `X-API-Key` 헤더를 검사한다. 미설정 시 인증 없이 동작 |
-| `N_THREADS` | 선택 | torch 스레드 수. 스켈레톤 단계에서는 로그만 남기고 실제로 적용하지 않는다 |
+| `MODEL_DIR` | `.` | config.json·model.safetensors 위치 |
+| `N_THREADS` | cpu_count | torch 스레드 수. 컨테이너 CPU 쿼터에 맞춰 반드시 명시 |
+| `API_KEY` | (없음) | 설정 시 X-API-Key 헤더 검사, 미설정 시 인증 없음 |

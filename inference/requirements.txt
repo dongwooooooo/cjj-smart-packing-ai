@@ -1,16 +1,12 @@
-fastapi
-uvicorn
-python-multipart
-pillow
-numpy
-mangum
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-# The following are required once the real HF ek09/logistics-dimension-3view
-# logic is merged into dimension.py, and are intentionally omitted from this
-# skeleton:
-# torch
-# timm
-# segmentation-models-pytorch
-# safetensors
-# scipy
-# huggingface_hub
+torch>=2.9.0
+timm>=1.0.28
+safetensors>=0.8.0
+fastapi>=0.141.1
+uvicorn>=0.52.2
+python-multipart>=0.0.32
+pillow>=11.3.0
+numpy>=2.2.6
+huggingface_hub>=1.27.0
+mangum>=0.19.0
