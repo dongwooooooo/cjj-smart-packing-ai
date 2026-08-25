@@ -1,6 +1,6 @@
 # EC2 배포
 
-치수 추정 API를 EC2(Amazon Linux 2023) 위에 상시 서버로 올리는 방법이다. 스크립트는 `deploy/ec2/`에 있다.
+치수 추정 API를 EC2(Ubuntu) 위에 상시 서버로 올리는 방법이다. 스크립트는 `deploy/ec2/`에 있다.
 
 ## 사전 준비
 

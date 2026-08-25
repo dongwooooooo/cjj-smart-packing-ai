@@ -1,5 +1,5 @@
 #!/bin/bash
-# Amazon Linux 2023 에서 치수 추정 API 를 systemd 서비스로 올린다.
+# Ubuntu 에서 치수 추정 API 를 systemd 서비스로 올린다. (ubuntu 계정 기준)
 #
 # 필수/선택 환경변수 (인자가 아니라 환경변수로 받는다):
 #   HF_TOKEN      허깅페이스 토큰 (필수)
@@ -38,22 +38,13 @@ else
 fi
 
 echo "== 2/5 시스템 패키지"
-sudo dnf install -y -q python3-pip python3-devel gcc >/dev/null
+sudo apt-get update -qq
+sudo apt-get install -y -qq python3-venv python3-pip >/dev/null
 
-echo "== 3/5 파이썬 패키지 (CPU 전용 torch — 5~8분)"
+echo "== 3/5 모델·코드 내려받기 ($MODEL_SOURCE)"
 python3 -m venv "$HOME_DIR/venv"
-source "$HOME_DIR/venv/bin/activate"
-pip install -q --upgrade pip
-# torch 와 torchvision 은 반드시 같은 저장소에서 함께 받는다.
-# torch 만 CPU 저장소에서 받으면, 뒤에서 segmentation-models-pytorch 가
-# torchvision 을 PyPI 기본 저장소(CUDA 빌드)에서 끌어와 짝이 어긋난다.
-# 그러면 기동할 때 'operator torchvision::nms does not exist' 로 죽는다.
-pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install -q timm segmentation-models-pytorch safetensors pillow numpy scipy \
-               huggingface_hub fastapi uvicorn python-multipart
-deactivate
-
-echo "== 4/5 모델·코드 내려받기 ($MODEL_SOURCE)"
+"$HOME_DIR/venv/bin/pip" install -q --upgrade pip
+"$HOME_DIR/venv/bin/pip" install -q huggingface_hub
 "$HOME_DIR/venv/bin/python3" - "$MODEL_SOURCE" "$HOME_DIR/model" <<'PY'
 import os
 import sys
@@ -63,6 +54,12 @@ repo, local_dir = sys.argv[1], sys.argv[2]
 p = snapshot_download(repo, token=os.environ["HF_TOKEN"], local_dir=local_dir)
 print("  받음:", p)
 PY
+
+echo "== 4/5 파이썬 패키지 (CPU 전용 torch — 5~8분)"
+# 의존성 목록은 모델 저장소의 requirements.txt 가 원천이다. 첫 줄의
+# --extra-index-url 이 CPU 전용 torch 휠을 받는다 — PyPI 기본 torch 는
+# CUDA 런타임까지 끌어와 수 GB 를 차지한다.
+"$HOME_DIR/venv/bin/pip" install -q -r "$HOME_DIR/model/requirements.txt"
 
 echo "== 5/5 systemd 서비스 설치·기동"
 sudo sed "s/--port 8000/--port ${PORT}/" "$SCRIPT_DIR/dimension-api.service" \
