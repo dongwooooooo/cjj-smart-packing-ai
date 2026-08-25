@@ -1,3 +1,5 @@
+# 변환·로컬 검증용 전체 의존성 (torch 계열 포함).
+# 배포 이미지 런타임은 requirements-runtime.txt 만 설치한다.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 torch>=2.9.0
@@ -10,3 +12,7 @@ pillow>=11.3.0
 numpy>=2.2.6
 huggingface_hub>=1.27.0
 mangum>=0.19.0
+
+# export_onnx.py — onnx 는 변환, onnxruntime 은 변환 직후 출력 대조에 쓴다.
+onnx>=1.22.0
+onnxruntime>=1.29.0

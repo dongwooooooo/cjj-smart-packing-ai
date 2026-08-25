@@ -6,10 +6,12 @@
 
 | 파일 | 역할 |
 |---|---|
-| [`deploy/lambda/Dockerfile`](../deploy/lambda/Dockerfile) | Lambda 런타임 이미지 정의 |
+| [`deploy/lambda/Dockerfile`](../deploy/lambda/Dockerfile) | 2단계 이미지 정의 (변환 스테이지 + 런타임 스테이지) |
 | [`deploy/lambda/Dockerfile.dockerignore`](../deploy/lambda/Dockerfile.dockerignore) | 이 이미지 전용 제외 목록 (`__pycache__`, `.venv` 등) |
 | [`deploy/lambda/build_push.sh`](../deploy/lambda/build_push.sh) | 이미지 빌드 → ECR push |
-| [`inference/`](../inference/) | API 코드 (`server.py`, `dimension.py`, `requirements.txt`) |
+| [`inference/`](../inference/) | API 코드 (`server.py`, `dimension.py`, `export_onnx.py`) |
+| [`inference/requirements.txt`](../inference/requirements.txt) | 변환 스테이지용 — torch·timm·onnx |
+| [`inference/requirements-runtime.txt`](../inference/requirements-runtime.txt) | 런타임 스테이지용 — onnxruntime, torch 없음 |
 
 ## 머지 순서
 
@@ -22,9 +24,40 @@
 Lambda는 zip 패키지 배포와 컨테이너 이미지 배포를 모두 지원합니다. 여기서는
 컨테이너 이미지를 씁니다.
 
-zip 배포는 압축 해제 기준 250MB 제한이 있습니다. torch와 torchvision만 CPU 빌드로
-받아도 이 한도를 넘습니다. 컨테이너 이미지는 10GB까지 허용되므로 의존성과 모델
-가중치(2~500MB)를 함께 담을 수 있습니다.
+zip 배포는 압축 해제 기준 250MB 제한이 있습니다. 컨테이너 이미지는 10GB까지
+허용되므로 의존성과 모델을 함께 담을 수 있습니다.
+
+## 이미지가 2단계로 빌드되는 이유
+
+추론은 ONNX Runtime으로 합니다. 그런데 학습·업로드는 torch 형식(`model.safetensors`)
+그대로입니다. 이 둘을 잇는 변환을 이미지 빌드가 대신합니다.
+
+| 스테이지 | 베이스 | 하는 일 | 최종 이미지에 남는가 |
+|---|---|---|---|
+| `builder` | `python:3.12-slim` | torch 설치 → 허깅페이스에서 `model.safetensors` 다운로드 → `export_onnx.py`로 `model.onnx` 변환 → torch 출력과 대조 | 아니오 |
+| `runtime` | `public.ecr.aws/lambda/python:3.12` | onnxruntime만 설치, `model.onnx`와 `config.json`만 받아 서비스 | 예 |
+
+여기서 세 가지가 갈립니다.
+
+1. **모델 업로더가 하던 일은 그대로입니다.** 허깅페이스에 `model.safetensors`만
+   올리면 됩니다. ONNX 변환을 사람이 돌려서 올리는 절차를 만들지 않습니다.
+2. **torch가 최종 이미지에 들어가지 않습니다.** torch·timm·safetensors는 변환
+   스테이지에서만 쓰이고, 런타임 스테이지는 `requirements-runtime.txt`만
+   설치합니다.
+3. **`model.safetensors`도 최종 이미지에 들어가지 않습니다.** 런타임 스테이지는
+   `COPY --from=builder`로 `model.onnx`와 `config.json` 두 파일만 골라 가져갑니다.
+   토큰으로 받은 원본 가중치가 이미지에 남지 않습니다.
+
+### 변환이 틀리면 빌드가 멈춥니다
+
+`export_onnx.py`는 변환 직후 같은 입력을 torch 모델과 ONNX 세션에 각각 넣고 출력을
+비교합니다. `max diff`가 `1e-4`를 넘으면 비정상 종료하고, 그러면 `docker build`가
+그 자리에서 실패합니다. 어긋난 그래프가 조용히 ECR로 올라가는 경로를 막는 장치입니다.
+
+로컬 실측(macOS, threads=4)에서는 `max diff 7.45e-08`, 예측값은 소수 1자리까지
+torch 경로와 같았습니다. 같은 사진 3장 기준 `predict()`는 1,070ms → 185ms,
+모델 로드는 3.10s → 0.22s였습니다. **Lambda에서의 이미지 크기·콜드스타트·응답
+시간은 재측정 예정입니다.**
 
 ## 왜 모델을 빌드 타임에 굽는가
 
@@ -61,31 +94,19 @@ RUN --mount=type=secret,id=hf_token \
 docker build --secret id=hf_token,src="$HOME/.hf_token" -f deploy/lambda/Dockerfile .
 ```
 
-## 현재 상태 — 스켈레톤
+### CPU 전용 torch 저장소를 쓰는 이유
 
-`inference/dimension.py` 가 아직 `NotImplementedError` 를 던지는 스켈레톤입니다.
-그래서 Dockerfile의 두 단계가 주석 처리돼 있습니다.
+`inference/requirements.txt` 첫 줄의 `--extra-index-url` 은 지우면 안 됩니다.
 
-| 주석 처리된 단계 | 해제 시점 |
-|---|---|
-| torch·torchvision CPU 설치 | `inference/requirements.txt` 에 torch 계열을 실제로 추가할 때 |
-| 모델 가중치 굽기 (`snapshot_download`) | 실제 추론 코드를 반영하고 HF 토큰이 준비됐을 때 |
-
-지금 상태로도 이미지 빌드와 배포는 됩니다. `/health` 는 정상 응답하고 `/predict` 는
-501을 반환합니다. 배포 경로를 먼저 검증하는 용도로 쓸 수 있습니다.
-
-### torch와 torchvision을 같이 받아야 하는 이유
-
-PyPI 기본 `torch` 는 CUDA 런타임을 함께 받아 이미지가 몇 GB 커집니다. Lambda에는
-GPU가 없으므로 CPU 전용 저장소에서 받습니다.
-
-이때 `torch` 와 `torchvision` 을 반드시 같은 명령으로, 같은 저장소에서 받아야 합니다.
-한쪽만 CPU 빌드가 되면 ABI가 어긋나 기동 시
-`operator torchvision::nms does not exist` 로 실패합니다.
+PyPI 기본 `torch` 는 CUDA 런타임을 함께 받아 몇 GB 커집니다. 변환 스테이지는 최종
+이미지에 남지 않으므로 이미지 크기에는 영향이 없지만, 빌드 시간과 빌드 캐시 용량이
+그만큼 늘어납니다. Lambda에도 CI 러너에도 GPU는 없습니다.
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
+
+B담당 배포 패키지는 `torchvision` 을 쓰지 않습니다.
 
 ## 최초 1회 절차
 
@@ -115,6 +136,14 @@ bash deploy/lambda/build_push.sh
 ```
 
 스크립트가 마지막에 이미지 URI를 출력합니다. 다음 단계에서 씁니다.
+
+> 빌드 스테이지가 허깅페이스에서 가중치를 받으므로 `docker build` 에
+> `--secret id=hf_token,src="$HOME/.hf_token"` 이 필요합니다. `build_push.sh` 는
+> 토큰을 인자로 받지 않습니다 — 인자나 환경변수로 넘기면 `ps aux` 와 셸 히스토리에
+> 남기 때문입니다. 스크립트의 `docker build` 줄에 직접 붙입니다.
+
+> 변환 스테이지에서 torch를 설치하므로 첫 빌드는 시간이 걸립니다. 두 번째부터는
+> `requirements.txt` 가 바뀌지 않는 한 그 레이어가 캐시에 남습니다.
 
 > Apple Silicon 맥에서 빌드해도 됩니다. 스크립트가 `--platform linux/amd64` 를
 > 붙입니다. 이 옵션 없이 빌드하면 arm64 이미지가 만들어져 함수 생성이 거부됩니다.
@@ -159,7 +188,7 @@ aws lambda create-function \
 | `--memory-size` | 10240 | Lambda는 메모리에 비례해 vCPU를 배정한다. 10,240MB에서 약 6 vCPU로 상한이다 |
 | `--timeout` | 60 | 콜드스타트에서 모델 로드 시간이 붙는다. 기본값 3초로는 첫 요청이 타임아웃된다 |
 | `API_KEY` | 발급한 키 | `/predict` 의 `X-API-Key` 헤더를 검증한다. 설정하지 않으면 인증 없이 열린다 |
-| `N_THREADS` | 6 | torch 스레드 수. 배정 vCPU를 넘기면 스레드끼리 CPU를 뺏어 느려진다 |
+| `N_THREADS` | 6 | 추론 스레드 수 — ONNX Runtime의 `intra_op_num_threads` 로 들어간다. 배정 vCPU를 넘기면 스레드끼리 CPU를 뺏어 느려진다 |
 
 API 키를 환경변수 평문으로 넣는 대신 Secrets Manager나 SSM Parameter Store에서
 읽는 방식도 가능합니다. 운영 반영 시점에 결정합니다.
@@ -202,9 +231,9 @@ FURL=$(aws lambda get-function-url-config \
 
 # 상태 확인 — 인증 불필요
 curl "${FURL}health"
-# {"status":"ok","model_loaded":false}
+# {"status":"ok","threads":6,"load_sec":0.2,"auth":"required"}
 
-# 추론 요청 — 이미지 3장 업로드 (스켈레톤 단계에서는 501 반환)
+# 추론 요청 — 이미지 3장 업로드
 curl -X POST "${FURL}predict" \
   -H "X-API-Key: <발급한 키>" \
   -F "images=@front.jpg" \
@@ -213,6 +242,16 @@ curl -X POST "${FURL}predict" \
 ```
 
 첫 호출은 콜드스타트라 수 초 걸립니다. 이어지는 호출은 빨라집니다.
+
+어느 추론 백엔드로 떴는지는 CloudWatch 로그 첫 줄에서 확인합니다. 배포 이미지는
+항상 아래처럼 찍혀야 합니다.
+
+```
+[dimension] ONNX Runtime 백엔드 — /opt/model/model.onnx
+```
+
+`torch 백엔드` 로 찍혔다면 `/opt/model/model.onnx` 가 이미지에 안 들어간 것이고,
+런타임 스테이지에는 torch가 없으므로 모델 로드에서 바로 실패합니다.
 
 ## 이미지 갱신 절차
 
@@ -259,14 +298,16 @@ aws lambda update-function-configuration \
 
 줄이는 방법:
 
-- 이미지 크기를 줄인다 — torch는 CPU 저장소에서 받고, `--no-cache-dir` 로 pip
-  캐시를 남기지 않는다 (Dockerfile에 적용돼 있음)
+- 이미지 크기를 줄인다 — torch·timm·`model.safetensors` 를 변환 스테이지에 두고
+  최종 이미지에서 뺐다. pip 캐시도 `--no-cache-dir` 로 남기지 않는다 (Dockerfile에
+  적용돼 있음)
 - 모델 로드를 모듈 import 시점에 한 번만 하고 요청마다 다시 하지 않는다
 - provisioned concurrency를 설정한다 — 지정한 수만큼 실행 환경을 미리 띄워 둬서
   콜드스타트를 없앤다. 대신 요청이 없어도 과금된다
 
-실측 수치는 미확인 — 실제 모델을 반영한 뒤 첫 호출과 이후 호출의 응답 시간을
-측정해 여기에 기록합니다.
+로컬(macOS)에서는 모델 로드가 3.10s에서 0.22s로 줄었습니다. **Lambda에서의 이미지
+크기와 콜드스타트 실측은 재측정 예정** — 첫 호출과 이후 호출의 응답 시간, `docker
+images` 기준 이미지 크기를 여기에 기록합니다.
 
 ## 제약
 
@@ -274,7 +315,7 @@ aws lambda update-function-configuration \
 |---|---|---|
 | vCPU 상한 | 약 6 (메모리 10,240MB 기준) | `N_THREADS` 를 6 이하로 둔다. 더 올려도 성능이 늘지 않고 스레드 경합만 생긴다 |
 | 함수 실행 시간 | 최대 15분 | 요청당 처리로는 충분하다. 배치 작업을 Lambda에 넣을 때만 문제가 된다 |
-| 이미지 크기 | 최대 10GB | torch CPU 빌드 + 모델 가중치는 들어간다. 여유가 없어지면 불필요한 의존성부터 정리한다 |
+| 이미지 크기 | 최대 10GB | onnxruntime + `model.onnx`(53MB) 라 여유가 크다. 실측은 재측정 예정 |
 | Function URL 요청 크기 | 6MB | 이미지 3장 multipart 합계가 이 한도를 넘으면 요청 자체가 거부된다 |
 | API Gateway 요청 크기 | 10MB | Function URL보다 여유가 있다 |
 | Lambda 이벤트 페이로드 | 동기 호출 6MB | 통로와 무관하게 걸리는 한도 |
