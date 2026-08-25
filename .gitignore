@@ -21,3 +21,6 @@ results/
 .DS_Store
 .idea/
 .vscode/
+
+# 로컬 테스트로 받은 모델 산출물 (가중치와 짝인 config)
+inference/config.json
