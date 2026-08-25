@@ -1,0 +1,327 @@
+# Ships the inference code to the EC2 instance and re-runs deploy/ec2/setup.sh
+# there, driven entirely by AWS Systems Manager (SSM) Run Command.
+#
+# No SSH key and no local .env are involved: the runner assumes an AWS role
+# through GitHub OIDC and talks to the SSM API, and the SSM agent already
+# present on the Ubuntu AMI executes the script on the instance.
+#
+# This is a separate workflow rather than a job inside build-deploy.yml because
+# GitHub applies `paths` filters per workflow, not per job. Sharing one file
+# would mean a Lambda-only change also restarts the EC2 service (pip install +
+# ONNX export, several minutes) and an EC2-only change also builds and pushes a
+# multi-GB image. The two tracks also want separate concurrency groups.
+#
+# See docs/cicd.md for the one-time IAM setup this workflow assumes.
+name: deploy-ec2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'inference/**'
+      - 'deploy/ec2/**'
+      - '.github/workflows/deploy-ec2.yml'
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: 'Target EC2 instance id. Empty falls back to the EC2_INSTANCE_ID variable, then to the built-in default.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+# cancel-in-progress is off on purpose. A cancelled deploy can leave the
+# instance with new code but a service that was never restarted, so an
+# in-flight run is allowed to finish and the next one queues behind it.
+concurrency:
+  group: deploy-ec2-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  DEFAULT_INSTANCE_ID: i-0c7dac45358b3fafc
+  # Conservative ceiling for the base64 payload embedded in the SSM command.
+  # The measured payload is ~16 KB; SSM caps the parameters of one command well
+  # above that, but the exact quota is not worth riding close to.
+  MAX_PAYLOAD_BYTES: '45000'
+  # Time SSM allows the script itself to run. setup.sh installs torch and runs
+  # the ONNX export, which takes several minutes on a small instance.
+  SSM_EXECUTION_TIMEOUT: '1800'
+  # How long this job polls for the command to finish before giving up.
+  POLL_TIMEOUT_SECONDS: '1800'
+
+jobs:
+  deploy-ec2:
+    name: deploy to ec2 via ssm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Read the dispatch input through env rather than interpolating it into
+      # the script body, and validate the shape before it reaches the AWS CLI.
+      - name: Resolve instance id
+        id: target
+        env:
+          INPUT_INSTANCE_ID: ${{ inputs.instance_id }}
+          VAR_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${INPUT_INSTANCE_ID:-${VAR_INSTANCE_ID:-$DEFAULT_INSTANCE_ID}}"
+          if ! printf '%s' "$INSTANCE_ID" | grep -Eq '^i-[0-9a-f]{8,17}$'; then
+            echo "::error::인스턴스 ID '${INSTANCE_ID}' 형식이 올바르지 않습니다. 예: i-0c7dac45358b3fafc"
+            exit 1
+          fi
+          echo "instance_id=${INSTANCE_ID}" >> "$GITHUB_OUTPUT"
+          echo "배포 대상: ${INSTANCE_ID} (${AWS_REGION})"
+
+      # A stopped instance, a missing instance profile, or an SSM agent that
+      # never registered all show up the same way: the instance is simply not in
+      # the managed list. Fail here with an actionable message instead of
+      # letting send-command return InvalidInstanceId.
+      - name: Check that the instance is managed by SSM
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+          PING=$(aws ssm describe-instance-information \
+                   --region "$AWS_REGION" \
+                   --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+                   --query 'InstanceInformationList[0].PingStatus' \
+                   --output text 2>/dev/null || echo "None")
+          if [ "$PING" != "Online" ]; then
+            echo "::error::인스턴스 ${INSTANCE_ID} 가 SSM 관리 대상이 아닙니다 (PingStatus=${PING}). 인스턴스가 실행 중인지, 인스턴스 프로파일에 AmazonSSMManagedInstanceCore 가 붙어 있는지 확인하세요. docs/cicd.md 참고."
+            exit 1
+          fi
+          echo "SSM 관리 상태 확인: ${INSTANCE_ID} (PingStatus=Online)"
+
+      # The instance pulls nothing by itself: no S3, no git clone, no SSH. The
+      # eight files it needs are packed here and carried inside the command.
+      - name: Pack deployment files
+        id: payload
+        run: |
+          set -euo pipefail
+          tar -czf payload.tgz \
+            deploy/ec2/setup.sh \
+            deploy/ec2/dimension-api.service \
+            inference/*.py \
+            inference/requirements*.txt
+          base64 < payload.tgz | tr -d '\n' > payload.b64
+          SIZE=$(wc -c < payload.b64 | tr -d '[:space:]')
+          if [ "$SIZE" -gt "$MAX_PAYLOAD_BYTES" ]; then
+            echo "::error::전송 파일 묶음이 ${SIZE} 바이트로 상한 ${MAX_PAYLOAD_BYTES} 을 넘었습니다. SSM 커맨드에 인라인으로 실을 수 없는 크기이므로 전달 방식을 바꿔야 합니다. docs/cicd.md 의 '파일이 커지면' 참고."
+            exit 1
+          fi
+          tar -tzf payload.tgz
+          echo "payload_bytes=${SIZE}" >> "$GITHUB_OUTPUT"
+          echo "묶음 크기: ${SIZE} 바이트 (base64, 상한 ${MAX_PAYLOAD_BYTES})"
+
+      # Composed in Python so every value that comes from a secret goes through
+      # shlex.quote. Hand-rolled shell quoting inside YAML inside JSON is where
+      # this kind of step usually breaks on an unusual character in a key.
+      #
+      # The request body written here contains both tokens in clear text. AWS
+      # keeps command parameters in the Run Command history for 30 days and
+      # there is no API to delete them, so anyone with ssm:ListCommands in this
+      # account can read them. See docs/cicd.md, "토큰 노출 범위".
+      - name: Build SSM request
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          API_KEY: ${{ secrets.EC2_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN}" ]; then
+            echo "::error::시크릿 HF_TOKEN 이 없습니다. 모델 파일을 내려받을 수 없어 셋업이 실패합니다. docs/cicd.md 의 시크릿 등록 절차를 먼저 수행하세요."
+            exit 1
+          fi
+          if [ -z "${API_KEY}" ]; then
+            echo "::warning title=EC2_API_KEY 미등록::API 인증 키 없이 배포합니다. 보안 그룹이 열려 있으면 누구나 호출할 수 있는 상태가 됩니다."
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shlex
+
+          payload = pathlib.Path("payload.b64").read_text().strip()
+          hf_token = os.environ["HF_TOKEN"]
+          api_key = os.environ.get("API_KEY", "")
+          sha = os.environ.get("GITHUB_SHA", "")[:7]
+
+          stage = "/home/ubuntu/.deploy-stage"
+          env_file = "/home/ubuntu/.deploy-env"
+
+          # Plain POSIX sh only. The SSM agent hands the script to /bin/sh,
+          # which is dash on Ubuntu, so `set -o pipefail`, arrays and [[ ]]
+          # are not available at this level. Anything that needs bash is run
+          # through an explicit `bash -c`.
+          #
+          # Everything runs as root here, and root's HOME is /root while both
+          # setup.sh and dimension-api.service are written around
+          # /home/ubuntu. The final step therefore drops to the ubuntu user
+          # with -H so HOME points at the right place.
+          commands = [
+              "set -e",
+              "umask 077",
+              f"STAGE={shlex.quote(stage)}",
+              f"ENV_FILE={shlex.quote(env_file)}",
+              'trap \'rm -rf "$STAGE" "$ENV_FILE"\' EXIT',
+              'if ! id -u ubuntu >/dev/null 2>&1; then echo "ubuntu 계정이 없습니다." >&2; exit 1; fi',
+              'rm -rf "$STAGE"',
+              'mkdir -p "$STAGE"',
+              f"printf '%s' {shlex.quote(payload)} | base64 -d > \"$STAGE/payload.tgz\"",
+              'tar -xzf "$STAGE/payload.tgz" -C "$STAGE"',
+              # Wipe the previous copy so a file deleted in the repo also
+              # disappears from the instance.
+              "rm -rf /home/ubuntu/inference",
+              "install -d -o ubuntu -g ubuntu /home/ubuntu/inference",
+              'cp "$STAGE"/inference/*.py "$STAGE"/inference/requirements*.txt /home/ubuntu/inference/',
+              'cp "$STAGE"/deploy/ec2/setup.sh /home/ubuntu/setup.sh',
+              'cp "$STAGE"/deploy/ec2/dimension-api.service /home/ubuntu/dimension-api.service',
+              "chown -R ubuntu:ubuntu /home/ubuntu/inference /home/ubuntu/setup.sh /home/ubuntu/dimension-api.service",
+              "chmod 644 /home/ubuntu/setup.sh /home/ubuntu/dimension-api.service",
+              # The tokens land in a 0600 file rather than on the setup.sh
+              # command line, so `ps aux` on the instance never shows them.
+              # The file is sourced and deleted in the same shell, and the
+              # EXIT trap removes it again if anything above fails.
+              "printf '%s\\n' {} {} > \"$ENV_FILE\"".format(
+                  shlex.quote("export HF_TOKEN=" + shlex.quote(hf_token)),
+                  shlex.quote("export API_KEY=" + shlex.quote(api_key)),
+              ),
+              'chown ubuntu:ubuntu "$ENV_FILE"',
+              'chmod 600 "$ENV_FILE"',
+              "sudo -H -u ubuntu bash -c '"
+              f". {env_file}; rm -f {env_file}; cd /home/ubuntu; exec bash setup.sh'",
+          ]
+
+          request = {
+              "InstanceIds": [os.environ["INSTANCE_ID"]],
+              "DocumentName": "AWS-RunShellScript",
+              "Comment": f"deploy-ec2 {sha}"[:100],
+              "TimeoutSeconds": 600,
+              "Parameters": {
+                  "executionTimeout": [os.environ["SSM_EXECUTION_TIMEOUT"]],
+                  "commands": commands,
+              },
+          }
+          pathlib.Path("ssm-request.json").write_text(json.dumps(request))
+          print("SSM 요청 본문 생성 완료 — 커맨드 줄 수:", len(commands))
+          PY
+
+      # send-command returns as soon as SSM accepts the request. The waiter
+      # caps out at 20 polls (100 seconds), far short of a full setup run, so
+      # it is called in a loop bounded by POLL_TIMEOUT_SECONDS.
+      - name: Run setup.sh on the instance
+        id: run
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --cli-input-json file://ssm-request.json \
+            --query 'Command.CommandId' --output text)
+          rm -f ssm-request.json payload.b64 payload.tgz
+          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+          echo "SSM 커맨드 전송: ${COMMAND_ID}"
+
+          # The invocation record is not queryable for the first second or two.
+          sleep 10
+
+          DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_SECONDS ))
+          STATUS="Pending"
+          while :; do
+            if aws ssm wait command-executed \
+                 --region "$AWS_REGION" \
+                 --command-id "$COMMAND_ID" \
+                 --instance-id "$INSTANCE_ID" 2>/dev/null; then
+              STATUS="Success"
+              break
+            fi
+            STATUS=$(aws ssm get-command-invocation \
+                       --region "$AWS_REGION" \
+                       --command-id "$COMMAND_ID" \
+                       --instance-id "$INSTANCE_ID" \
+                       --query 'Status' --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Pending|InProgress|Delayed)
+                if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                  echo "::error::${POLL_TIMEOUT_SECONDS}초 안에 끝나지 않았습니다 (마지막 상태 ${STATUS}). 커맨드 ${COMMAND_ID} 는 인스턴스에서 계속 돌고 있을 수 있습니다. AWS 콘솔 → Systems Manager → Run Command 에서 확인하세요."
+                  exit 1
+                fi
+                echo "진행 중 (${STATUS}) — 대기"
+                ;;
+              *)
+                break
+                ;;
+            esac
+          done
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "최종 상태: ${STATUS}"
+
+      # Always runs: a failed setup is exactly when the instance-side log is
+      # needed. StandardOutputContent is truncated by the API at 24,000
+      # characters, so the tail of a long run may be missing here.
+      - name: Show instance output
+        if: always() && steps.run.outputs.command_id != ''
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.run.outputs.command_id }}
+        run: |
+          set -euo pipefail
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text || true
+          echo "----- stderr -----"
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text || true
+
+      - name: Report result
+        if: always() && steps.run.outputs.command_id != ''
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.run.outputs.command_id }}
+          PAYLOAD_BYTES: ${{ steps.payload.outputs.payload_bytes }}
+        run: |
+          set -euo pipefail
+          STATUS=$(aws ssm get-command-invocation \
+                     --region "$AWS_REGION" \
+                     --command-id "$COMMAND_ID" \
+                     --instance-id "$INSTANCE_ID" \
+                     --query 'Status' --output text 2>/dev/null || echo "Unknown")
+          CODE=$(aws ssm get-command-invocation \
+                   --region "$AWS_REGION" \
+                   --command-id "$COMMAND_ID" \
+                   --instance-id "$INSTANCE_ID" \
+                   --query 'ResponseCode' --output text 2>/dev/null || echo "-1")
+          {
+            echo "### EC2 배포 ${STATUS}"
+            echo ""
+            echo "- 인스턴스: \`${INSTANCE_ID}\`"
+            echo "- SSM 커맨드: \`${COMMAND_ID}\`"
+            echo "- 종료 코드: \`${CODE}\`"
+            echo "- 전송 묶음: ${PAYLOAD_BYTES} 바이트 (base64)"
+            echo "- 커밋: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::SSM 커맨드가 ${STATUS} 로 끝났습니다 (종료 코드 ${CODE}). 위 'Show instance output' 단계의 출력과, 인스턴스에서 sudo journalctl -u dimension-api -n 50 을 확인하세요."
+            exit 1
+          fi
+          echo "배포 완료: ${INSTANCE_ID}"

@@ -30,7 +30,9 @@
 
 ## 배포 절차
 
-로컬(레포를 받은 PC)에서 배포 파일과 추론 코드를 함께 올린 뒤, 접속해서 실행한다.
+main에 머지된 뒤의 배포는 GitHub Actions가 한다. `inference/`나 `deploy/ec2/`가 바뀌면 `deploy-ec2` 워크플로가 SSM으로 코드를 보내고 아래 `setup.sh`를 인스턴스에서 실행한다. 코드는 그대로고 모델만 바뀐 경우는 Actions 탭에서 수동 실행한다. [cicd.md](cicd.md) 참고.
+
+아래 절차는 최초 구축, 또는 워크플로가 막혔을 때 쓰는 수동 경로다. 로컬(레포를 받은 PC)에서 배포 파일과 추론 코드를 함께 올린 뒤, 접속해서 실행한다.
 
 ```bash
 scp -r -i <키페어> deploy/ec2/setup.sh deploy/ec2/dimension-api.service inference ubuntu@<인스턴스IP>:~/
