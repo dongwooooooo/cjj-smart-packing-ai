@@ -14,9 +14,10 @@ from typing import List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 
-from dimension import DimensionModel
+from dimension import load_model
 
 MODEL_DIR = os.environ.get("MODEL_DIR", ".")
+# 추론 스레드 수 (ONNX Runtime intra_op / torch set_num_threads — 백엔드에 따라 적용).
 # 컨테이너/인스턴스에 할당된 CPU 수보다 많이 잡으면 스레드 경합으로 크게 느려진다.
 # 반드시 명시적으로 지정할 것 — 기본값(os.cpu_count())은 호스트 전체 코어 수를 볼 수
 # 있어 컨테이너 쿼터보다 클 위험이 있다.
@@ -33,7 +34,7 @@ def check_key(x_api_key: str = Header(default="")):
 
 app = FastAPI(title="물류 물품 치수 추정 (B)", version="1.0")
 _t0 = time.time()
-MODEL = DimensionModel(MODEL_DIR, threads=THREADS)
+MODEL = load_model(MODEL_DIR, threads=THREADS)
 LOAD_SEC = time.time() - _t0
 
 

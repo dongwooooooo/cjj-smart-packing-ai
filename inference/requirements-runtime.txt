@@ -1,0 +1,16 @@
+# 추론 런타임 전용 의존성 — torch 없음.
+#
+# 배포 이미지(Lambda)는 model.onnx 만 싣고 onnxruntime 으로 추론한다. torch·timm·
+# safetensors 는 변환 단계(requirements.txt)에서만 필요하고, 런타임에는 쓰이지
+# 않는다. 이 파일에 torch 를 다시 넣으면 이미지가 GB 단위로 커진다.
+#
+# dimension.py 는 torch/onnxruntime 을 각 클래스 안에서 지연 임포트하므로,
+# 이 목록만 설치된 환경에서도 임포트와 ONNX 추론이 동작한다.
+
+onnxruntime>=1.29.0
+fastapi>=0.141.1
+uvicorn>=0.52.2
+python-multipart>=0.0.32
+pillow>=11.3.0
+numpy>=2.2.6
+mangum>=0.19.0
