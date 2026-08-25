@@ -14,3 +14,6 @@
 .git
 .env
 .env.*
+# 로컬 테스트로 inference/ 에 내려받은 모델 산출물 — 이미지에는 2) 단계가 /opt/model 로 굽는다
+**/*.safetensors
+inference/config.json
