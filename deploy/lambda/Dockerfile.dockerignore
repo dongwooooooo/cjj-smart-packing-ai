@@ -1,0 +1,16 @@
+# 이 Dockerfile 전용 제외 목록. BuildKit 은 <Dockerfile 경로>.dockerignore 를
+# 먼저 찾고, 없을 때만 컨텍스트 루트의 .dockerignore 를 쓴다. 레포 루트에
+# .dockerignore 를 두면 다른 배포 트랙(EC2 등)까지 영향을 받으므로 여기에 둔다.
+#
+# COPY inference/ 가 로컬 빌드 환경의 캐시·가상환경까지 이미지에 실어 나르는 것을
+# 막는다. 특히 __pycache__ 는 빌드한 사람의 로컬 파이썬 버전으로 만들어진
+# .pyc 가 들어가므로 이미지에 남을 이유가 없다.
+**/__pycache__
+**/*.py[cod]
+**/.venv
+**/venv
+**/.pytest_cache
+**/.DS_Store
+.git
+.env
+.env.*
