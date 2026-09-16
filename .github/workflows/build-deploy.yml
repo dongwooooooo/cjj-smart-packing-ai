@@ -292,6 +292,13 @@ jobs:
             --name live --function-version "$VERSION" >/dev/null
           echo "live -> version ${VERSION}"
 
+          # 별칭을 옮긴 직후 첫 호출은 새 버전의 콜드 스타트(초기화 약 10초)라 백엔드 계약(8초)을 넘긴다.
+          # 배포 잡이 그 첫 호출을 대신 받아 둔다. 유휴 회수 뒤에는 다시 콜드가 될 수 있다.
+          printf '{"version":"2.0","routeKey":"GET /health","rawPath":"/health","rawQueryString":"","headers":{},"requestContext":{"http":{"method":"GET","path":"/health","protocol":"HTTP/1.1","sourceIp":"127.0.0.1","userAgent":"deploy-warmup"},"routeKey":"GET /health","stage":"$default"},"isBase64Encoded":false}' > warm.json
+          aws lambda invoke --region "$AWS_REGION" --function-name "${FUNCTION_NAME}:live" \
+            --payload fileb://warm.json warm-out.json --query StatusCode --output text
+          cat warm-out.json; echo
+
           # 승격된 모델의 평가 결과가 다음 후보의 기준선이 된다.
           aws s3 cp "s3://${EVAL_BUCKET}/results/${EVAL_PREFIX}/${IMAGE_TAG}/summary.json" \
             "s3://${EVAL_BUCKET}/baselines/${EVAL_PREFIX}/summary.json" --only-show-errors
