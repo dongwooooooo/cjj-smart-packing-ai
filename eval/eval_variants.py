@@ -129,7 +129,12 @@ def main():
             calib.append((lambda paths: (lambda: batch(paths)))(cal_items[k]))  # 지연 로딩
         print(f"calibration batches: {len(calib)} from {a.calib}", flush=True)
 
-    paths = build_variants(a.model_dir, a.out, calib, a.static_method, a.exclude_edges, a.reduce_range)
+    # fp32 만 평가할 때(배포 게이트)는 변환 라이브러리 없이 서빙 모델을 그대로 쓴다.
+    if a.variants.split(",") == ["fp32"]:
+        os.makedirs(a.out, exist_ok=True)
+        paths = {"fp32": os.path.join(a.model_dir, "model.onnx")}
+    else:
+        paths = build_variants(a.model_dir, a.out, calib, a.static_method, a.exclude_edges, a.reduce_range)
     tgt_mean = np.array(base.cfg["tgt_mean"]); tgt_std = np.array(base.cfg["tgt_std"])
     so = ort.SessionOptions(); so.intra_op_num_threads = a.threads
     summary = {}; per_item = {}
