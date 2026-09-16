@@ -203,9 +203,13 @@ jobs:
             rc=${PIPESTATUS[0]}
             set -e
           else
-            echo "기준선 없음 — 이 후보를 기준선으로 등록하고 통과시킨다."
-            printf '{"pass": true, "reasons": ["bootstrap: 기준선 없음"]}\n' | tee verdict.json
-            rc=0
+            # 기준선이 없으면 비열화 비교는 할 수 없지만 절대 상한(축별 MAE 3cm)은 그대로 적용한다.
+            # 후보를 자기 자신과 비교하면 비열화 항목은 0 이 되고 절대 상한만 남는다.
+            echo "기준선 없음 — 절대 상한만 판정하고, 통과하면 이 후보를 기준선으로 등록한다."
+            set +e
+            python eval/gate.py --baseline results/summary.json:fp32 --candidate results/summary.json:fp32 | tee verdict.json
+            rc=${PIPESTATUS[0]}
+            set -e
           fi
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
           {
