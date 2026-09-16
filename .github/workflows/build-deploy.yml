@@ -39,6 +39,10 @@ concurrency:
 env:
   AWS_REGION: ap-northeast-2
   ECR_REPO: logistics-dimension-api
+  # 고정셋 평가 데이터가 있는 비공개 버킷과 접두사. 접두사 아래에 VS/{KAN}_{barcode}/*_1_[123].jpg 와
+  # index/items.csv 가 있어야 한다. 기준선은 baselines/{접두사}/summary.json 에 둔다.
+  EVAL_BUCKET: ${{ vars.EVAL_BUCKET || 'cjj-eval-data-300390308149' }}
+  EVAL_PREFIX: ${{ vars.EVAL_PREFIX || 'smoke' }}
 
 jobs:
   build-push:
@@ -133,9 +137,110 @@ jobs:
             echo "- 커밋: \`${GITHUB_SHA}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # 배포 전 정확도 게이트. push 된 이미지에서 model.onnx 를 꺼내 고정셋으로 평가하고, S3 의 기준선과
+  # 비교해 비열화·절대 상한을 통과해야 다음 잡(deploy-lambda)이 돈다. 기준선이 없으면(첫 실행) 후보를
+  # 기준선으로 등록하고 통과시킨다. 판정 근거는 잡 요약에 남고 결과 JSON 은 S3 results/ 에 쌓인다.
+  eval-gate:
+    name: accuracy gate on fixed set
+    needs: build-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 평가는 서빙 이미지에 구워진 바로 그 model.onnx 로 한다. 변환을 다시 하지 않는다.
+      - name: Extract model from the pushed image
+        env:
+          IMAGE_URI: ${{ needs.build-push.outputs.image-uri }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "$IMAGE_URI" >/dev/null
+          cid=$(docker create --platform linux/amd64 "$IMAGE_URI")
+          docker cp "$cid:/opt/model/model.onnx" inference/model.onnx
+          docker cp "$cid:/opt/model/config.json" inference/config.json
+          docker rm "$cid" >/dev/null
+          ls -la inference/model.onnx inference/config.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: pip install -r inference/requirements-runtime.txt onnx
+
+      - name: Download fixed evaluation set
+        run: |
+          set -euo pipefail
+          aws s3 sync "s3://${EVAL_BUCKET}/${EVAL_PREFIX}" data --only-show-errors
+          test -f data/index/items.csv
+          echo "품목 폴더: $(find data/VS -mindepth 1 -maxdepth 1 -type d | wc -l)"
+
+      - name: Evaluate candidate (FP32, serving preprocessing)
+        run: |
+          python eval/eval_variants.py --vs data/VS --items data/index/items.csv \
+            --model-dir inference --out results --threads 2 --variants fp32
+
+      - name: Judge against baseline
+        id: gate
+        run: |
+          set -euo pipefail
+          key="baselines/${EVAL_PREFIX}/summary.json"
+          if aws s3 cp "s3://${EVAL_BUCKET}/${key}" baseline.json --only-show-errors 2>/dev/null; then
+            set +e
+            python eval/gate.py --baseline baseline.json:fp32 --candidate results/summary.json:fp32 | tee verdict.json
+            rc=${PIPESTATUS[0]}
+            set -e
+          else
+            echo "기준선 없음 — 이 후보를 기준선으로 등록하고 통과시킨다."
+            printf '{"pass": true, "reasons": ["bootstrap: 기준선 없음"]}\n' | tee verdict.json
+            rc=0
+          fi
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 정확도 게이트 (${EVAL_PREFIX})"
+            echo ""
+            echo '```json'; cat verdict.json; echo '```'
+            echo ""
+            echo '후보 요약:'; echo '```json'
+            python -c "import json;print(json.dumps(json.load(open('results/summary.json'))['summary']['fp32'],indent=1))"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: Keep results
+        if: always()
+        env:
+          TAG: ${{ needs.build-push.outputs.image-tag }}
+        run: |
+          [ -f results/summary.json ] || exit 0
+          aws s3 cp results/summary.json "s3://${EVAL_BUCKET}/results/${EVAL_PREFIX}/${TAG}/summary.json" --only-show-errors
+          [ -f verdict.json ] && aws s3 cp verdict.json "s3://${EVAL_BUCKET}/results/${EVAL_PREFIX}/${TAG}/verdict.json" --only-show-errors || true
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: eval-${{ needs.build-push.outputs.image-tag }}
+          path: |
+            results/summary.json
+            results/per_item.json
+            verdict.json
+          if-no-files-found: ignore
+
   deploy-lambda:
     name: update lambda function
-    needs: build-push
+    needs: [build-push, eval-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS credentials (OIDC)
@@ -151,6 +256,7 @@ jobs:
         env:
           FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME || 'logistics-dimension-api' }}
           IMAGE_URI: ${{ needs.build-push.outputs.image-uri }}
+          IMAGE_TAG: ${{ needs.build-push.outputs.image-tag }}
         run: |
           if ! aws lambda get-function \
                  --region "$AWS_REGION" \
@@ -179,9 +285,20 @@ jobs:
             --region "$AWS_REGION" \
             --function-name "$FUNCTION_NAME"
 
+          # 백엔드는 :live 만 부른다. 게이트를 통과한 버전으로 별칭을 옮겨야 배포가 완결된다.
+          VERSION=$(aws lambda publish-version --region "$AWS_REGION" --function-name "$FUNCTION_NAME" --query Version --output text)
+          aws lambda update-alias --region "$AWS_REGION" --function-name "$FUNCTION_NAME" \
+            --name live --function-version "$VERSION" >/dev/null
+          echo "live -> version ${VERSION}"
+
+          # 승격된 모델의 평가 결과가 다음 후보의 기준선이 된다.
+          aws s3 cp "s3://${EVAL_BUCKET}/results/${EVAL_PREFIX}/${IMAGE_TAG}/summary.json" \
+            "s3://${EVAL_BUCKET}/baselines/${EVAL_PREFIX}/summary.json" --only-show-errors
+
           {
             echo "### Lambda 갱신 완료"
             echo ""
             echo "- 함수: \`${FUNCTION_NAME}\`"
             echo "- 이미지: \`${IMAGE_URI}\`"
+            echo "- live 별칭: 버전 ${VERSION}"
           } >> "$GITHUB_STEP_SUMMARY"
